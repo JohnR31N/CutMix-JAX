@@ -1,4 +1,5 @@
 import argparse
+from functools import partial
 from typing import Dict, Any
 
 import jax
@@ -30,6 +31,7 @@ def parse_args():
 
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--cutmix-alpha", type=float, default=1.0)
+    parser.add_argument("--cutmix-prob", type=float, default=1.0)
 
     return parser.parse_args()
 
@@ -116,7 +118,7 @@ def train_step_baseline(state, batch):
     return state, metrics
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("cutmix_alpha",))
 def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
     images = jnp.asarray(batch["image"])
     labels = jnp.asarray(batch["label"])
@@ -152,7 +154,8 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
     state = state.apply_gradients(grads=grads)
     state = state.replace(batch_stats=new_model_state["batch_stats"])
 
-    # CutMix train acc 只是粗略参考，因为 label 是 mixed 的
+    # CutMix train acc is only a rough reference,
+    # because the target is a mixed label.
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == info["labels_a"])
 
     metrics = {
@@ -197,20 +200,30 @@ def run_epoch_train(state, train_ds, args, rng):
     train_accs = []
     train_lams = []
 
+    cutmix_count = 0
+    total_count = 0
+
     for step, batch in enumerate(numpy_iterator(train_ds)):
-        rng, step_rng = jax.random.split(rng)
+        rng, step_rng, prob_rng = jax.random.split(rng, 3)
+        total_count += 1
 
         if args.aug == "none":
             state, metrics = train_step_baseline(state, batch)
 
         elif args.aug == "cutmix":
-            state, metrics = train_step_cutmix(
-                state,
-                batch,
-                step_rng,
-                args.cutmix_alpha,
-            )
-            train_lams.append(float(metrics["lam"]))
+            use_cutmix = bool(jax.random.uniform(prob_rng) < args.cutmix_prob)
+
+            if use_cutmix:
+                state, metrics = train_step_cutmix(
+                    state,
+                    batch,
+                    step_rng,
+                    args.cutmix_alpha,
+                )
+                train_lams.append(float(metrics["lam"]))
+                cutmix_count += 1
+            else:
+                state, metrics = train_step_baseline(state, batch)
 
         else:
             raise ValueError(f"Unsupported augmentation: {args.aug}")
@@ -225,6 +238,9 @@ def run_epoch_train(state, train_ds, args, rng):
 
     if train_lams:
         output["lam"] = sum(train_lams) / len(train_lams)
+
+    if args.aug == "cutmix":
+        output["cutmix_rate"] = cutmix_count / total_count
 
     return state, output, rng
 
@@ -269,13 +285,20 @@ def main():
 
     print("=" * 80)
     print("Training configuration")
-    print(f"Dataset:      {args.dataset}")
-    print(f"Model:        {args.model}")
-    print(f"Augmentation: {args.aug}")
-    print(f"Batch size:   {args.batch_size}")
-    print(f"Epochs:       {args.epochs}")
-    print(f"Learning rate:{args.lr}")
-    print(f"Device:       {jax.devices()}")
+    print(f"Dataset:       {args.dataset}")
+    print(f"Model:         {args.model}")
+    print(f"Augmentation:  {args.aug}")
+    print(f"Batch size:    {args.batch_size}")
+    print(f"Epochs:        {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Seed:          {args.seed}")
+    print(f"Data dir:      {args.data_dir}")
+
+    if args.aug == "cutmix":
+        print(f"CutMix alpha:  {args.cutmix_alpha}")
+        print(f"CutMix prob:   {args.cutmix_prob}")
+
+    print(f"Device:        {jax.devices()}")
     print("=" * 80)
 
     for epoch in range(1, args.epochs + 1):
@@ -301,6 +324,9 @@ def main():
 
         if "lam" in train_metrics:
             msg += f" | avg lam {train_metrics['lam']:.4f}"
+
+        if "cutmix_rate" in train_metrics:
+            msg += f" | cutmix rate {train_metrics['cutmix_rate']:.4f}"
 
         print(msg)
 

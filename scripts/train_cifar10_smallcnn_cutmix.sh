@@ -10,4 +10,5 @@ python train.py \
   --lr 1e-3 \
   --seed 0 \
   --data-dir ./data \
-  --cutmix-alpha 1.0
+  --cutmix-alpha 1.0 \
+  --cutmix-prob 0.5
