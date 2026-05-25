@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training import train_state
+from tqdm import tqdm
 
 from cutmix_jax.datasets import get_cifar10_dataset, numpy_iterator
 from cutmix_jax.losses import classification_loss, cutmix_loss
@@ -104,8 +105,9 @@ def create_datasets(dataset_name: str, batch_size: int, data_dir: str):
 
         num_classes = 10
         num_train_examples = 50000
+        num_test_examples = 10000
 
-        return train_ds, test_ds, num_classes, num_train_examples
+        return train_ds, test_ds, num_classes, num_train_examples, num_test_examples
 
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -291,7 +293,7 @@ def eval_step(state, batch):
     }
 
 
-def run_epoch_train(state, train_ds, args, rng):
+def run_epoch_train(state, train_ds, args, rng, epoch: int, steps_per_epoch: int):
     train_losses = []
     train_accs = []
     train_lams = []
@@ -299,7 +301,15 @@ def run_epoch_train(state, train_ds, args, rng):
     cutmix_count = 0
     total_count = 0
 
-    for batch in numpy_iterator(train_ds):
+    train_iter = tqdm(
+        numpy_iterator(train_ds),
+        total=steps_per_epoch,
+        desc=f"Train Epoch {epoch:03d}",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    for batch in train_iter:
         rng, step_rng, prob_rng = jax.random.split(rng, 3)
         total_count += 1
 
@@ -324,8 +334,24 @@ def run_epoch_train(state, train_ds, args, rng):
         else:
             raise ValueError(f"Unsupported augmentation: {args.aug}")
 
-        train_losses.append(float(metrics["loss"]))
-        train_accs.append(float(metrics["acc"]))
+        loss = float(metrics["loss"])
+        acc = float(metrics["acc"])
+
+        train_losses.append(loss)
+        train_accs.append(acc)
+
+        postfix = {
+            "loss": f"{sum(train_losses) / len(train_losses):.4f}",
+            "acc": f"{sum(train_accs) / len(train_accs):.4f}",
+        }
+
+        if train_lams:
+            postfix["lam"] = f"{sum(train_lams) / len(train_lams):.4f}"
+
+        if args.aug == "cutmix":
+            postfix["cutmix"] = f"{cutmix_count / total_count:.3f}"
+
+        train_iter.set_postfix(postfix)
 
     output = {
         "loss": sum(train_losses) / len(train_losses),
@@ -337,14 +363,33 @@ def run_epoch_train(state, train_ds, args, rng):
     return state, output, rng
 
 
-def run_epoch_eval(state, test_ds):
+def run_epoch_eval(state, test_ds, epoch: int, test_steps: int):
     test_losses = []
     test_accs = []
 
-    for batch in numpy_iterator(test_ds):
+    test_iter = tqdm(
+        numpy_iterator(test_ds),
+        total=test_steps,
+        desc=f"Eval  Epoch {epoch:03d}",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    for batch in test_iter:
         metrics = eval_step(state, batch)
-        test_losses.append(float(metrics["loss"]))
-        test_accs.append(float(metrics["acc"]))
+
+        loss = float(metrics["loss"])
+        acc = float(metrics["acc"])
+
+        test_losses.append(loss)
+        test_accs.append(acc)
+
+        test_iter.set_postfix(
+            {
+                "loss": f"{sum(test_losses) / len(test_losses):.4f}",
+                "acc": f"{sum(test_accs) / len(test_accs):.4f}",
+            }
+        )
 
     return {
         "loss": sum(test_losses) / len(test_losses),
@@ -411,7 +456,7 @@ def create_csv_writer(csv_path):
     return csv_file, writer
 
 
-def print_config(args, steps_per_epoch: int):
+def print_config(args, steps_per_epoch: int, test_steps: int):
     print("=" * 80)
     print("Training configuration")
     print(f"Dataset:            {args.dataset}")
@@ -425,7 +470,8 @@ def print_config(args, steps_per_epoch: int):
     print(f"Augmentation:       {args.aug}")
     print(f"Batch size:         {args.batch_size}")
     print(f"Epochs:             {args.epochs}")
-    print(f"Steps per epoch:    {steps_per_epoch}")
+    print(f"Train steps/epoch:  {steps_per_epoch}")
+    print(f"Eval steps/epoch:   {test_steps}")
     print(f"Learning rate:      {args.lr}")
     print(f"Optimizer:          {args.optimizer}")
 
@@ -454,13 +500,14 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    train_ds, test_ds, num_classes, num_train_examples = create_datasets(
+    train_ds, test_ds, num_classes, num_train_examples, num_test_examples = create_datasets(
         dataset_name=args.dataset,
         batch_size=args.batch_size,
         data_dir=args.data_dir,
     )
 
     steps_per_epoch = (num_train_examples + args.batch_size - 1) // args.batch_size
+    test_steps = (num_test_examples + args.batch_size - 1) // args.batch_size
 
     model = create_model(
         args=args,
@@ -474,7 +521,7 @@ def main():
         steps_per_epoch=steps_per_epoch,
     )
 
-    print_config(args, steps_per_epoch)
+    print_config(args, steps_per_epoch, test_steps)
 
     csv_path = get_csv_path(args)
     csv_file, csv_writer = create_csv_writer(csv_path)
@@ -493,11 +540,15 @@ def main():
                 train_ds=train_ds,
                 args=args,
                 rng=rng,
+                epoch=epoch,
+                steps_per_epoch=steps_per_epoch,
             )
 
             test_metrics = run_epoch_eval(
                 state=state,
                 test_ds=test_ds,
+                epoch=epoch,
+                test_steps=test_steps,
             )
 
             epoch_time = time.time() - epoch_start_time
