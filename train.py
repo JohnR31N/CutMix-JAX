@@ -25,18 +25,38 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generic JAX training script")
 
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
+
     parser.add_argument(
         "--model",
         type=str,
         default="small_cnn",
         choices=["small_cnn", "pyramidnet"],
     )
-    parser.add_argument("--aug", type=str, default="none", choices=["none", "cutmix"])
+
+    parser.add_argument(
+        "--aug",
+        type=str,
+        default="none",
+        choices=["none", "cutmix"],
+    )
 
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"])
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+
+    parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="none",
+        choices=["none", "multistep"],
+    )
+    parser.add_argument("--lr-milestones", type=str, default="150,225")
+    parser.add_argument("--lr-gamma", type=float, default=0.1)
 
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./outputs")
@@ -83,16 +103,77 @@ def create_datasets(dataset_name: str, batch_size: int, data_dir: str):
         )
 
         num_classes = 10
-        return train_ds, test_ds, num_classes
+        num_train_examples = 50000
+
+        return train_ds, test_ds, num_classes, num_train_examples
 
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
-def create_train_state(rng, model, learning_rate: float):
+def parse_milestones(milestones: str):
+    if milestones.strip() == "":
+        return []
+
+    return [int(x.strip()) for x in milestones.split(",") if x.strip()]
+
+
+def create_lr_schedule(args, steps_per_epoch: int):
+    if args.lr_schedule == "none":
+        return args.lr
+
+    if args.lr_schedule == "multistep":
+        milestones = parse_milestones(args.lr_milestones)
+
+        boundaries_and_scales = {
+            milestone * steps_per_epoch: args.lr_gamma
+            for milestone in milestones
+        }
+
+        return optax.piecewise_constant_schedule(
+            init_value=args.lr,
+            boundaries_and_scales=boundaries_and_scales,
+        )
+
+    raise ValueError(f"Unsupported LR schedule: {args.lr_schedule}")
+
+
+def create_optimizer(args, steps_per_epoch: int):
+    learning_rate = create_lr_schedule(
+        args=args,
+        steps_per_epoch=steps_per_epoch,
+    )
+
+    if args.optimizer == "adam":
+        return optax.adam(
+            learning_rate=learning_rate,
+        )
+
+    if args.optimizer == "sgd":
+        sgd = optax.sgd(
+            learning_rate=learning_rate,
+            momentum=args.momentum,
+            nesterov=True,
+        )
+
+        if args.weight_decay > 0.0:
+            return optax.chain(
+                optax.add_decayed_weights(args.weight_decay),
+                sgd,
+            )
+
+        return sgd
+
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
+def create_train_state(rng, model, args, steps_per_epoch: int):
     dummy_x = jnp.ones((1, 32, 32, 3), dtype=jnp.float32)
     variables = model.init(rng, dummy_x, train=True)
 
-    tx = optax.adam(learning_rate)
+    tx = create_optimizer(
+        args=args,
+        steps_per_epoch=steps_per_epoch,
+    )
 
     return TrainState.create(
         apply_fn=model.apply,
@@ -314,6 +395,12 @@ def create_csv_writer(csv_path):
         "seed",
         "batch_size",
         "learning_rate",
+        "optimizer",
+        "momentum",
+        "weight_decay",
+        "lr_schedule",
+        "lr_milestones",
+        "lr_gamma",
         "cutmix_alpha",
         "cutmix_prob",
     ]
@@ -324,7 +411,7 @@ def create_csv_writer(csv_path):
     return csv_file, writer
 
 
-def print_config(args):
+def print_config(args, steps_per_epoch: int):
     print("=" * 80)
     print("Training configuration")
     print(f"Dataset:            {args.dataset}")
@@ -338,7 +425,17 @@ def print_config(args):
     print(f"Augmentation:       {args.aug}")
     print(f"Batch size:         {args.batch_size}")
     print(f"Epochs:             {args.epochs}")
+    print(f"Steps per epoch:    {steps_per_epoch}")
     print(f"Learning rate:      {args.lr}")
+    print(f"Optimizer:          {args.optimizer}")
+
+    if args.optimizer == "sgd":
+        print(f"Momentum:           {args.momentum}")
+        print(f"Weight decay:       {args.weight_decay}")
+        print(f"LR schedule:        {args.lr_schedule}")
+        print(f"LR milestones:      {args.lr_milestones}")
+        print(f"LR gamma:           {args.lr_gamma}")
+
     print(f"Seed:               {args.seed}")
     print(f"Data dir:           {args.data_dir}")
     print(f"Output dir:         {args.output_dir}")
@@ -357,11 +454,13 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    train_ds, test_ds, num_classes = create_datasets(
+    train_ds, test_ds, num_classes, num_train_examples = create_datasets(
         dataset_name=args.dataset,
         batch_size=args.batch_size,
         data_dir=args.data_dir,
     )
+
+    steps_per_epoch = (num_train_examples + args.batch_size - 1) // args.batch_size
 
     model = create_model(
         args=args,
@@ -371,10 +470,11 @@ def main():
     state = create_train_state(
         rng=init_rng,
         model=model,
-        learning_rate=args.lr,
+        args=args,
+        steps_per_epoch=steps_per_epoch,
     )
 
-    print_config(args)
+    print_config(args, steps_per_epoch)
 
     csv_path = get_csv_path(args)
     csv_file, csv_writer = create_csv_writer(csv_path)
@@ -456,6 +556,12 @@ def main():
                     "seed": args.seed,
                     "batch_size": args.batch_size,
                     "learning_rate": args.lr,
+                    "optimizer": args.optimizer,
+                    "momentum": args.momentum,
+                    "weight_decay": args.weight_decay,
+                    "lr_schedule": args.lr_schedule,
+                    "lr_milestones": args.lr_milestones,
+                    "lr_gamma": args.lr_gamma,
                     "cutmix_alpha": args.cutmix_alpha,
                     "cutmix_prob": args.cutmix_prob,
                 }

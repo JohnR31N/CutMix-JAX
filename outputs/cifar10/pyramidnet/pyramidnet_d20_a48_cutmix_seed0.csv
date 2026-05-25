@@ -1,0 +1,1 @@
+epoch,dataset,model,aug,pyramid_depth,pyramid_alpha,pyramid_bottleneck,train_loss,train_acc,test_loss,test_acc,test_error,best_test_acc,avg_lam,cutmix_rate,epoch_time_sec,total_time_sec,seed,batch_size,learning_rate,cutmix_alpha,cutmix_prob
