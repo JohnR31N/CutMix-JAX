@@ -1,6 +1,9 @@
 import argparse
+import csv
+import os
+import time
 from functools import partial
-from typing import Dict, Any
+from typing import Any, Dict
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +33,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument("--output-dir", type=str, default="./outputs")
+
     parser.add_argument("--cutmix-alpha", type=float, default=1.0)
     parser.add_argument("--cutmix-prob", type=float, default=1.0)
 
@@ -110,12 +115,10 @@ def train_step_baseline(state, batch):
 
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
 
-    metrics = {
+    return state, {
         "loss": loss,
         "acc": acc,
     }
-
-    return state, metrics
 
 
 @partial(jax.jit, static_argnames=("cutmix_alpha",))
@@ -154,17 +157,14 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
     state = state.apply_gradients(grads=grads)
     state = state.replace(batch_stats=new_model_state["batch_stats"])
 
-    # CutMix train acc is only a rough reference,
-    # because the target is a mixed label.
+    # This is only a rough reference because CutMix uses mixed labels.
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == info["labels_a"])
 
-    metrics = {
+    return state, {
         "loss": loss,
         "acc": acc,
         "lam": info["lam"],
     }
-
-    return state, metrics
 
 
 @jax.jit
@@ -187,12 +187,10 @@ def eval_step(state, batch):
     loss = classification_loss(logits, labels)
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
 
-    metrics = {
+    return {
         "loss": loss,
         "acc": acc,
     }
-
-    return metrics
 
 
 def run_epoch_train(state, train_ds, args, rng):
@@ -203,7 +201,7 @@ def run_epoch_train(state, train_ds, args, rng):
     cutmix_count = 0
     total_count = 0
 
-    for step, batch in enumerate(numpy_iterator(train_ds)):
+    for batch in numpy_iterator(train_ds):
         rng, step_rng, prob_rng = jax.random.split(rng, 3)
         total_count += 1
 
@@ -238,9 +236,13 @@ def run_epoch_train(state, train_ds, args, rng):
 
     if train_lams:
         output["lam"] = sum(train_lams) / len(train_lams)
+    else:
+        output["lam"] = None
 
     if args.aug == "cutmix":
         output["cutmix_rate"] = cutmix_count / total_count
+    else:
+        output["cutmix_rate"] = 0.0
 
     return state, output, rng
 
@@ -258,6 +260,70 @@ def run_epoch_eval(state, test_ds):
         "loss": sum(test_losses) / len(test_losses),
         "acc": sum(test_accs) / len(test_accs),
     }
+
+
+def get_csv_path(args):
+    run_dir = os.path.join(
+        args.output_dir,
+        args.dataset,
+        args.model,
+    )
+    os.makedirs(run_dir, exist_ok=True)
+
+    filename = f"{args.aug}_seed{args.seed}.csv"
+    return os.path.join(run_dir, filename)
+
+
+def create_csv_writer(csv_path):
+    csv_file = open(csv_path, mode="w", newline="")
+
+    fieldnames = [
+        "epoch",
+        "dataset",
+        "model",
+        "aug",
+        "train_loss",
+        "train_acc",
+        "test_loss",
+        "test_acc",
+        "test_error",
+        "best_test_acc",
+        "avg_lam",
+        "cutmix_rate",
+        "epoch_time_sec",
+        "total_time_sec",
+        "seed",
+        "batch_size",
+        "learning_rate",
+        "cutmix_alpha",
+        "cutmix_prob",
+    ]
+
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    writer.writeheader()
+
+    return csv_file, writer
+
+
+def print_config(args):
+    print("=" * 80)
+    print("Training configuration")
+    print(f"Dataset:       {args.dataset}")
+    print(f"Model:         {args.model}")
+    print(f"Augmentation:  {args.aug}")
+    print(f"Batch size:    {args.batch_size}")
+    print(f"Epochs:        {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Seed:          {args.seed}")
+    print(f"Data dir:      {args.data_dir}")
+    print(f"Output dir:    {args.output_dir}")
+
+    if args.aug == "cutmix":
+        print(f"CutMix alpha:  {args.cutmix_alpha}")
+        print(f"CutMix prob:   {args.cutmix_prob}")
+
+    print(f"Device:        {jax.devices()}")
+    print("=" * 80)
 
 
 def main():
@@ -283,52 +349,101 @@ def main():
         learning_rate=args.lr,
     )
 
+    print_config(args)
+
+    csv_path = get_csv_path(args)
+    csv_file, csv_writer = create_csv_writer(csv_path)
+
+    print(f"CSV log: {csv_path}")
+
+    best_test_acc = 0.0
+    total_start_time = time.time()
+
+    try:
+        for epoch in range(1, args.epochs + 1):
+            epoch_start_time = time.time()
+
+            state, train_metrics, rng = run_epoch_train(
+                state=state,
+                train_ds=train_ds,
+                args=args,
+                rng=rng,
+            )
+
+            test_metrics = run_epoch_eval(
+                state=state,
+                test_ds=test_ds,
+            )
+
+            epoch_time = time.time() - epoch_start_time
+            total_time = time.time() - total_start_time
+
+            train_loss = train_metrics["loss"]
+            train_acc = train_metrics["acc"]
+            test_loss = test_metrics["loss"]
+            test_acc = test_metrics["acc"]
+            test_error = 1.0 - test_acc
+
+            best_test_acc = max(best_test_acc, test_acc)
+
+            avg_lam = train_metrics["lam"]
+            cutmix_rate = train_metrics["cutmix_rate"]
+
+            msg = (
+                f"Epoch {epoch:03d} | "
+                f"train loss {train_loss:.4f} | "
+                f"train acc {train_acc:.4f} | "
+                f"test loss {test_loss:.4f} | "
+                f"test acc {test_acc:.4f} | "
+                f"test error {test_error:.4f} | "
+                f"best test acc {best_test_acc:.4f}"
+            )
+
+            if avg_lam is not None:
+                msg += f" | avg lam {avg_lam:.4f}"
+
+            if args.aug == "cutmix":
+                msg += f" | cutmix rate {cutmix_rate:.4f}"
+
+            msg += f" | epoch time {epoch_time:.1f}s"
+
+            print(msg)
+
+            csv_writer.writerow(
+                {
+                    "epoch": epoch,
+                    "dataset": args.dataset,
+                    "model": args.model,
+                    "aug": args.aug,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "test_loss": test_loss,
+                    "test_acc": test_acc,
+                    "test_error": test_error,
+                    "best_test_acc": best_test_acc,
+                    "avg_lam": "" if avg_lam is None else avg_lam,
+                    "cutmix_rate": cutmix_rate,
+                    "epoch_time_sec": epoch_time,
+                    "total_time_sec": total_time,
+                    "seed": args.seed,
+                    "batch_size": args.batch_size,
+                    "learning_rate": args.lr,
+                    "cutmix_alpha": args.cutmix_alpha,
+                    "cutmix_prob": args.cutmix_prob,
+                }
+            )
+            csv_file.flush()
+
+    finally:
+        csv_file.close()
+
+    final_total_time = time.time() - total_start_time
     print("=" * 80)
-    print("Training configuration")
-    print(f"Dataset:       {args.dataset}")
-    print(f"Model:         {args.model}")
-    print(f"Augmentation:  {args.aug}")
-    print(f"Batch size:    {args.batch_size}")
-    print(f"Epochs:        {args.epochs}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Seed:          {args.seed}")
-    print(f"Data dir:      {args.data_dir}")
-
-    if args.aug == "cutmix":
-        print(f"CutMix alpha:  {args.cutmix_alpha}")
-        print(f"CutMix prob:   {args.cutmix_prob}")
-
-    print(f"Device:        {jax.devices()}")
+    print(f"Training finished.")
+    print(f"Best test acc: {best_test_acc:.4f}")
+    print(f"CSV saved to: {csv_path}")
+    print(f"Total time: {final_total_time:.1f}s")
     print("=" * 80)
-
-    for epoch in range(1, args.epochs + 1):
-        state, train_metrics, rng = run_epoch_train(
-            state=state,
-            train_ds=train_ds,
-            args=args,
-            rng=rng,
-        )
-
-        test_metrics = run_epoch_eval(
-            state=state,
-            test_ds=test_ds,
-        )
-
-        msg = (
-            f"Epoch {epoch:03d} | "
-            f"train loss {train_metrics['loss']:.4f} | "
-            f"train acc {train_metrics['acc']:.4f} | "
-            f"test loss {test_metrics['loss']:.4f} | "
-            f"test acc {test_metrics['acc']:.4f}"
-        )
-
-        if "lam" in train_metrics:
-            msg += f" | avg lam {train_metrics['lam']:.4f}"
-
-        if "cutmix_rate" in train_metrics:
-            msg += f" | cutmix rate {train_metrics['cutmix_rate']:.4f}"
-
-        print(msg)
 
 
 if __name__ == "__main__":
