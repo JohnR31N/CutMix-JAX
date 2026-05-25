@@ -14,6 +14,7 @@ from cutmix_jax.datasets import get_cifar10_dataset, numpy_iterator
 from cutmix_jax.losses import classification_loss, cutmix_loss
 from cutmix_jax.cutmix import cutmix_batch
 from cutmix_jax.models.small_cnn import SmallCNN
+from cutmix_jax.models.pyramidnet import PyramidNet
 
 
 class TrainState(train_state.TrainState):
@@ -23,8 +24,13 @@ class TrainState(train_state.TrainState):
 def parse_args():
     parser = argparse.ArgumentParser(description="Generic JAX training script")
 
-    parser.add_argument("--dataset", type=str, default="cifar10")
-    parser.add_argument("--model", type=str, default="small_cnn")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="small_cnn",
+        choices=["small_cnn", "pyramidnet"],
+    )
     parser.add_argument("--aug", type=str, default="none", choices=["none", "cutmix"])
 
     parser.add_argument("--batch-size", type=int, default=128)
@@ -38,14 +44,26 @@ def parse_args():
     parser.add_argument("--cutmix-alpha", type=float, default=1.0)
     parser.add_argument("--cutmix-prob", type=float, default=1.0)
 
+    parser.add_argument("--pyramid-depth", type=int, default=20)
+    parser.add_argument("--pyramid-alpha", type=int, default=48)
+    parser.add_argument("--pyramid-bottleneck", action="store_true")
+
     return parser.parse_args()
 
 
-def create_model(model_name: str, num_classes: int):
-    if model_name == "small_cnn":
+def create_model(args, num_classes: int):
+    if args.model == "small_cnn":
         return SmallCNN(num_classes=num_classes)
 
-    raise ValueError(f"Unsupported model: {model_name}")
+    if args.model == "pyramidnet":
+        return PyramidNet(
+            depth=args.pyramid_depth,
+            alpha=args.pyramid_alpha,
+            num_classes=num_classes,
+            bottleneck=args.pyramid_bottleneck,
+        )
+
+    raise ValueError(f"Unsupported model: {args.model}")
 
 
 def create_datasets(dataset_name: str, batch_size: int, data_dir: str):
@@ -157,7 +175,6 @@ def train_step_cutmix(state, batch, rng, cutmix_alpha: float):
     state = state.apply_gradients(grads=grads)
     state = state.replace(batch_stats=new_model_state["batch_stats"])
 
-    # This is only a rough reference because CutMix uses mixed labels.
     acc = jnp.mean(jnp.argmax(logits, axis=-1) == info["labels_a"])
 
     return state, {
@@ -232,17 +249,9 @@ def run_epoch_train(state, train_ds, args, rng):
     output = {
         "loss": sum(train_losses) / len(train_losses),
         "acc": sum(train_accs) / len(train_accs),
+        "lam": sum(train_lams) / len(train_lams) if train_lams else None,
+        "cutmix_rate": cutmix_count / total_count if args.aug == "cutmix" else 0.0,
     }
-
-    if train_lams:
-        output["lam"] = sum(train_lams) / len(train_lams)
-    else:
-        output["lam"] = None
-
-    if args.aug == "cutmix":
-        output["cutmix_rate"] = cutmix_count / total_count
-    else:
-        output["cutmix_rate"] = 0.0
 
     return state, output, rng
 
@@ -270,7 +279,14 @@ def get_csv_path(args):
     )
     os.makedirs(run_dir, exist_ok=True)
 
-    filename = f"{args.aug}_seed{args.seed}.csv"
+    if args.model == "pyramidnet":
+        model_tag = f"pyramidnet_d{args.pyramid_depth}_a{args.pyramid_alpha}"
+        if args.pyramid_bottleneck:
+            model_tag += "_bottleneck"
+    else:
+        model_tag = args.model
+
+    filename = f"{model_tag}_{args.aug}_seed{args.seed}.csv"
     return os.path.join(run_dir, filename)
 
 
@@ -282,6 +298,9 @@ def create_csv_writer(csv_path):
         "dataset",
         "model",
         "aug",
+        "pyramid_depth",
+        "pyramid_alpha",
+        "pyramid_bottleneck",
         "train_loss",
         "train_acc",
         "test_loss",
@@ -308,21 +327,27 @@ def create_csv_writer(csv_path):
 def print_config(args):
     print("=" * 80)
     print("Training configuration")
-    print(f"Dataset:       {args.dataset}")
-    print(f"Model:         {args.model}")
-    print(f"Augmentation:  {args.aug}")
-    print(f"Batch size:    {args.batch_size}")
-    print(f"Epochs:        {args.epochs}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Seed:          {args.seed}")
-    print(f"Data dir:      {args.data_dir}")
-    print(f"Output dir:    {args.output_dir}")
+    print(f"Dataset:            {args.dataset}")
+    print(f"Model:              {args.model}")
+
+    if args.model == "pyramidnet":
+        print(f"Pyramid depth:      {args.pyramid_depth}")
+        print(f"Pyramid alpha:      {args.pyramid_alpha}")
+        print(f"Pyramid bottleneck: {args.pyramid_bottleneck}")
+
+    print(f"Augmentation:       {args.aug}")
+    print(f"Batch size:         {args.batch_size}")
+    print(f"Epochs:             {args.epochs}")
+    print(f"Learning rate:      {args.lr}")
+    print(f"Seed:               {args.seed}")
+    print(f"Data dir:           {args.data_dir}")
+    print(f"Output dir:         {args.output_dir}")
 
     if args.aug == "cutmix":
-        print(f"CutMix alpha:  {args.cutmix_alpha}")
-        print(f"CutMix prob:   {args.cutmix_prob}")
+        print(f"CutMix alpha:       {args.cutmix_alpha}")
+        print(f"CutMix prob:        {args.cutmix_prob}")
 
-    print(f"Device:        {jax.devices()}")
+    print(f"Device:             {jax.devices()}")
     print("=" * 80)
 
 
@@ -339,7 +364,7 @@ def main():
     )
 
     model = create_model(
-        model_name=args.model,
+        args=args,
         num_classes=num_classes,
     )
 
@@ -415,6 +440,9 @@ def main():
                     "dataset": args.dataset,
                     "model": args.model,
                     "aug": args.aug,
+                    "pyramid_depth": args.pyramid_depth if args.model == "pyramidnet" else "",
+                    "pyramid_alpha": args.pyramid_alpha if args.model == "pyramidnet" else "",
+                    "pyramid_bottleneck": args.pyramid_bottleneck if args.model == "pyramidnet" else "",
                     "train_loss": train_loss,
                     "train_acc": train_acc,
                     "test_loss": test_loss,
@@ -439,7 +467,7 @@ def main():
 
     final_total_time = time.time() - total_start_time
     print("=" * 80)
-    print(f"Training finished.")
+    print("Training finished.")
     print(f"Best test acc: {best_test_acc:.4f}")
     print(f"CSV saved to: {csv_path}")
     print(f"Total time: {final_total_time:.1f}s")
