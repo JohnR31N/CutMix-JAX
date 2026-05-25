@@ -1,8 +1,11 @@
 import jax.numpy as jnp
 
-from cutmix_jax.losses import cross_entropy_with_integer_labels, cutmix_loss
 
-
+from cutmix_jax.losses import (
+    cross_entropy_with_integer_labels,
+    classification_loss,
+    cutmix_loss,
+)
 def test_cross_entropy_shape():
     logits = jnp.array([
         [2.0, 0.1, 0.1],
@@ -28,6 +31,18 @@ def test_cutmix_loss_scalar():
     }
 
     loss = cutmix_loss(logits, info)
+
+    assert loss.shape == ()
+    assert loss >= 0.0
+
+def test_classification_loss_scalar():
+    logits = jnp.array([
+        [2.0, 0.1, 0.1],
+        [0.1, 2.0, 0.1],
+    ])
+    labels = jnp.array([0, 1])
+
+    loss = classification_loss(logits, labels)
 
     assert loss.shape == ()
     assert loss >= 0.0

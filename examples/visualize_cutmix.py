@@ -34,7 +34,7 @@ def main():
     print("perm:", info["perm"])
     print("box:", info["box"])
 
-    idx = 0
+    idx = 1
     source_idx = int(info["perm"][idx])
 
     fig, axes = plt.subplots(1, 3, figsize=(9, 3))

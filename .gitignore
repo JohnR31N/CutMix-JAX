@@ -8,3 +8,4 @@ data/
 checkpoints/
 work_dirs/
 wandb/
+data/

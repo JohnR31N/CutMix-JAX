@@ -5,3 +5,6 @@ optax
 numpy
 pytest
 matplotlib
+tensorflow-datasets
+flax
+optax
