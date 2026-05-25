@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: cutmix-jax
+Version: 0.1.0
+Summary: A lightweight JAX implementation of CutMix
+Requires-Python: >=3.10
+License-File: LICENSE
+Dynamic: license-file
